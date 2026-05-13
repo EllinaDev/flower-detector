@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision>=0.15.0
+fastapi>=0.95.0
+uvicorn>=0.21.0
+python-multipart
+datasets>=2.11.0
+pillow>=9.5.0
+numpy
+matplotlib
+seaborn
+scikit-learn
