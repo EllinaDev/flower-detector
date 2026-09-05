@@ -1,20 +1,36 @@
 """
 main.py: FastAPI production-grade inference server for Flower Recognition.
-Part of the 'app/' directory for Clean Architecture.
 """
+
+import os
+import logging
+import asyncio
+# 1. Load environment variables IMMEDIATELY before any other imports
+try:
+    from dotenv import load_dotenv
+    # Search for .env in current or parent folder, OVERRIDE ensures new keys are picked up
+    env_loaded = load_dotenv(override=True) or load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
+except ImportError:
+    pass
 
 import io
 import json
-import logging
-import os
 import torch
 import torch.nn as nn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from pydantic import BaseModel
 from torchvision import models, transforms
 from typing import Dict, Optional
+
+# 2. Now import RAG engine (it will see the environment variables)
+try:
+    from app.rag_chat import rag_answer
+except ImportError:
+    from rag_chat import rag_answer
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,7 +41,7 @@ app = FastAPI(title="Flower Recognition API", version="1.0.1")
 # CORS middleware for frontend interaction
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*", "null"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,6 +50,8 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "..", "models", "flower_model_v2.pth")
 LABEL_MAP_PATH = os.path.join(BASE_DIR, "..", "data", "mappings", "label_mapping.json")
+MIN_RECOGNITION_CONFIDENCE = float(os.getenv("MIN_RECOGNITION_CONFIDENCE", "0.60"))
+MIN_RECOGNITION_MARGIN = float(os.getenv("MIN_RECOGNITION_MARGIN", "0.12"))
 
 # Device selection (optimized for Mac)
 if torch.backends.mps.is_available():
@@ -48,6 +66,7 @@ logger.info(f"Inference device: {DEVICE}")
 # Global variables for model and mapping
 MODEL: Optional[nn.Module] = None
 LABEL_MAP: Optional[Dict[int, str]] = None
+model_lock = asyncio.Lock()
 
 def load_model_assets():
     """Loads the model and label mapping from disk."""
@@ -89,7 +108,8 @@ def load_model_assets():
 
 @app.on_event("startup")
 async def startup_event():
-    load_model_assets()
+    async with model_lock:
+        load_model_assets()
 
 def get_inference_transforms():
     """Returns standard preprocessing transforms for inference."""
@@ -99,6 +119,30 @@ def get_inference_transforms():
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
+
+
+def build_prediction_payload(class_id: int, flower_name: str, confidence: float, margin: float) -> Dict[str, object]:
+    """Return either a recognized flower or an honest unknown result."""
+    recognized = confidence >= MIN_RECOGNITION_CONFIDENCE and margin >= MIN_RECOGNITION_MARGIN
+
+    if not recognized:
+        return {
+            "recognized": False,
+            "flower_name": "UNKNOWN",
+            "confidence": confidence,
+            "class_id": class_id,
+            "margin": margin,
+            "message": "I cannot confidently recognize this image. The image may show something that is not a flower, or this flower may not be in my database.",
+        }
+
+    return {
+        "recognized": True,
+        "flower_name": flower_name.upper(),
+        "confidence": confidence,
+        "class_id": class_id,
+        "margin": margin,
+        "message": "Flower recognized.",
+    }
 
 @app.get("/health")
 def health_check():
@@ -112,10 +156,11 @@ def health_check():
 # THE PREDICTION LOGIC
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    if MODEL is None:
-        load_model_assets()
+    async with model_lock:
         if MODEL is None:
-            raise HTTPException(status_code=503, detail="Model not loaded or training artifacts missing.")
+            load_model_assets()
+            if MODEL is None:
+                raise HTTPException(status_code=503, detail="Model not loaded or training artifacts missing.")
 
     try:
         # Read and validate image
@@ -130,20 +175,81 @@ async def predict(file: UploadFile = File(...)):
     input_tensor = preprocess(image).unsqueeze(0).to(DEVICE)
 
     # Inference
-    with torch.no_grad():
-        outputs = MODEL(input_tensor)  # The moment of classification
-        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-        confidence, index = torch.max(probabilities, 0)
+    async with model_lock:
+        with torch.no_grad():
+            outputs = MODEL(input_tensor)  # The moment of classification
+            probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
+            top_values, top_indices = torch.topk(probabilities, k=min(3, probabilities.numel()))
+            confidence = top_values[0]
+            index = top_indices[0]
+            runner_up = top_values[1] if top_values.numel() > 1 else torch.tensor(0.0, device=DEVICE)
         
     class_id = index.item()
     conf_score = confidence.item()
-    flower_name = LABEL_MAP.get(class_id, f"Unknown (ID: {class_id})").upper()
+    margin = (confidence - runner_up).item()
+    flower_name = LABEL_MAP.get(class_id, f"Unknown (ID: {class_id})")
+    response = build_prediction_payload(class_id, flower_name, conf_score, margin)
+    response["top_predictions"] = [
+        {
+            "class_id": idx.item(),
+            "flower_name": LABEL_MAP.get(idx.item(), f"Unknown (ID: {idx.item()})").upper(),
+            "confidence": value.item(),
+        }
+        for value, idx in zip(top_values, top_indices)
+    ]
+    return response
 
-    return {
-        "flower_name": flower_name,
-        "confidence": conf_score,
-        "class_id": class_id
-    }
+# ─── RAG Chatbot Endpoint ───────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    question: str
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """
+    RAG pipeline:
+      1. User question received
+      2. DuckDuckGo fetches live web data
+      3. Context (DuckDuckGo results) combined
+      4. Gemini LLM generates the final answer
+    """
+    if not request.question or not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    try:
+        result = await rag_answer(request.question.strip())
+        return result
+    except Exception as e:
+        logger.error(f"Chat endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate response.")
+
+
+# Serve static files
+STATIC_DIR = os.path.join(BASE_DIR, "..", "static")
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+@app.get("/")
+async def read_index():
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": "BloomIQ API is running. Static files not found."}
+
+@app.get("/styles.css")
+async def read_styles():
+    styles_path = os.path.join(STATIC_DIR, "styles.css")
+    if os.path.exists(styles_path):
+        return FileResponse(styles_path, media_type="text/css")
+    raise HTTPException(status_code=404, detail="styles.css not found")
+
+@app.get("/app.js")
+async def read_js():
+    js_path = os.path.join(STATIC_DIR, "app.js")
+    if os.path.exists(js_path):
+        return FileResponse(js_path, media_type="application/javascript")
+    raise HTTPException(status_code=404, detail="app.js not found")
+
 
 if __name__ == "__main__":
     import uvicorn

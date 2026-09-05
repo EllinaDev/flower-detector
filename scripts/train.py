@@ -1,4 +1,4 @@
-A#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 train.py: Production-grade training script for Flower Recognition using MobileNetV2.
 Includes advanced metrics (Loss/Accuracy plots) and Confusion Matrix generation.
@@ -74,7 +74,7 @@ def setup_model(num_classes: int = 102, device: torch.device = torch.device("cpu
     except Exception:
         model = models.mobilenet_v2(pretrained=True)
     
-    # Freeze backbone
+    # Freeze backbone, we dont want to change first layer 
     for param in model.features.parameters():
         param.requires_grad = False
         
@@ -94,11 +94,11 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
         
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad()    # Clear previous mistakes
+        outputs = model(images)         # Make a guess
+        loss = criterion(outputs, labels)    # See how wrong the guess was
+        loss.backward()     # Calculate how to fix the mistake
+        optimizer.step()    # Actually update the brain
         
         running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
